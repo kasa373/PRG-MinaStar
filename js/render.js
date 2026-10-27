@@ -4,6 +4,18 @@ import {
 
 const MIN_RADIUS = 8;
 
+// shade は −30..30。0 が今の色、+30 で黒。マイナス側は同じ幅だけ夜空を明るくする。
+function shadeHex(hex, shade) {
+  const k = Math.max(-30, Math.min(30, Number(shade) || 0)) / 30;
+  const n = Number.parseInt(hex.slice(1), 16);
+  const rgb = [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+  const out = rgb.map((c) => {
+    if (k >= 0) return Math.round(c * (1 - k));
+    return Math.round(c + (168 - c) * -k * 0.55);
+  });
+  return `rgb(${out[0]},${out[1]},${out[2]})`;
+}
+
 export function decodeStars(buffer) {
   const view = new DataView(buffer);
   const n = Math.floor(buffer.byteLength / 6);
@@ -46,10 +58,11 @@ export function indexFaint(stars) {
   return { counts, starts, indices };
 }
 
-function starSize(mag, viewRadius) {
+function starSize(mag, viewRadius, scale) {
   const zoom = 90 / viewRadius;
-  const s = (7.2 - mag) * 0.55 * Math.pow(zoom, 0.35);
-  return Math.max(mag > 5.5 ? 0.8 : 1.1, Math.min(8, s));
+  const s = (7.2 - mag) * 0.55 * Math.pow(zoom, 0.35) * scale;
+  const floor = (mag > 5.5 ? 0.8 : 1.1) * scale;
+  return Math.max(floor, Math.min(8 * scale, s));
 }
 
 export function createRenderer(canvas) {
@@ -118,13 +131,15 @@ export function createRenderer(canvas) {
       jd, precess, lat, lst, magLimit, viewRadius, centerAlt, centerAz,
       stars, faint, faintIndex, showFaint, faintLimit, sky, onLand,
     } = state;
-    const ground = onLand ? '#16120e' : '#071018';
+    const shade = state.shade;
+    const starScale = Math.max(1, Math.min(5, Number(state.starScale) || 1));
+    const ground = shadeHex(onLand ? '#16120e' : '#071018', shade);
     const cx = w / 2;
     const cy = h / 2;
     const skyGrad = ctx.createLinearGradient(0, 0, 0, h);
-    skyGrad.addColorStop(0, '#060912');
-    skyGrad.addColorStop(0.58, '#0b1222');
-    skyGrad.addColorStop(1, '#162033');
+    skyGrad.addColorStop(0, shadeHex('#060912', shade));
+    skyGrad.addColorStop(0.58, shadeHex('#0b1222', shade));
+    skyGrad.addColorStop(1, shadeHex('#162033', shade));
     ctx.fillStyle = skyGrad;
     ctx.fillRect(0, 0, w, h);
 
@@ -154,7 +169,7 @@ export function createRenderer(canvas) {
       view[2] * up[0] - view[0] * up[2],
       view[0] * up[1] - view[1] * up[0],
     ];
-    const ang = Math.max(0.08, viewRadius * DEG);
+    const ang = Math.max(0.15, viewRadius) * DEG;
     const focal = Math.max(w, h) / 2 / Math.tan(ang);
     const maxAng = Math.atan(Math.hypot(w, h) / 2 / focal) * 1.05;
 
@@ -357,11 +372,16 @@ export function createRenderer(canvas) {
       if (faintPixel || mag >= 3.2) {
         const a = faintPixel ? (0.4 + (11 - mag) * 0.1) * fade : (0.45 + fade * 0.55);
         const rgb = faintPixel ? [206, 214, 228] : bvColor(bv);
-        plotPoint(p.x, p.y, rgb, a);
-        if (!faintPixel && mag < 5.2) plotPoint(p.x + 1, p.y, rgb, a * 0.7);
+        if (starScale <= 1.001) {
+          plotPoint(p.x, p.y, rgb, a);
+          if (!faintPixel && mag < 5.2) plotPoint(p.x + 1, p.y, rgb, a * 0.7);
+          return;
+        }
+        const radius = (faintPixel ? 0.55 : (mag < 5.2 ? 1.15 : 0.7)) * starScale;
+        plot(p.x, p.y, radius, rgb, a);
         return;
       }
-      plot(p.x, p.y, starSize(mag, viewRadius), bvColor(bv), 0.55 + fade * 0.45);
+      plot(p.x, p.y, starSize(mag, viewRadius, starScale), bvColor(bv), 0.55 + fade * 0.45);
     };
 
     let faintBox = null;
@@ -432,28 +452,30 @@ export function createRenderer(canvas) {
       });
     }
 
-    ctx.lineWidth = Math.max(1, dpr);
-    ctx.strokeStyle = 'rgba(150, 176, 214, 0.42)';
-    ctx.lineCap = 'round';
-    for (const c of sky.constellations) {
-      for (const seg of c.lines) {
-        ctx.beginPath();
-        let started = false;
-        let last = null;
-        for (const pt of seg) {
-          const p = projectRaDec(pt[0], pt[1], false);
-          if (!p) {
-            started = false;
-            last = null;
-            continue;
+    if (state.showLines !== false) {
+      ctx.lineWidth = Math.max(1, dpr);
+      ctx.strokeStyle = 'rgba(150, 176, 214, 0.42)';
+      ctx.lineCap = 'round';
+      for (const c of sky.constellations) {
+        for (const seg of c.lines) {
+          ctx.beginPath();
+          let started = false;
+          let last = null;
+          for (const pt of seg) {
+            const p = projectRaDec(pt[0], pt[1], false);
+            if (!p) {
+              started = false;
+              last = null;
+              continue;
+            }
+            if (!started || (last && Math.hypot(p.x - last.x, p.y - last.y) > Math.min(w, h) * 0.45)) {
+              ctx.moveTo(p.x, p.y);
+            } else ctx.lineTo(p.x, p.y);
+            last = p;
+            started = true;
           }
-          if (!started || (last && Math.hypot(p.x - last.x, p.y - last.y) > Math.min(w, h) * 0.45)) {
-            ctx.moveTo(p.x, p.y);
-          } else ctx.lineTo(p.x, p.y);
-          last = p;
-          started = true;
+          ctx.stroke();
         }
-        ctx.stroke();
       }
     }
 
@@ -511,11 +533,13 @@ export function createRenderer(canvas) {
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     const nameRank = viewRadius > 72 ? 1 : viewRadius > 34 ? 2 : 3;
-    for (const c of sky.constellations) {
-      if (c.rank > nameRank) continue;
-      const p = projectRaDec(c.label[0], c.label[1], false);
-      if (!p || p.delta > maxAng * 0.92) continue;
-      ctx.fillText(c.name, p.x, p.y);
+    if (state.showNames !== false) {
+      for (const c of sky.constellations) {
+        if (c.rank > nameRank) continue;
+        const p = projectRaDec(c.label[0], c.label[1], false);
+        if (!p || p.delta > maxAng * 0.92) continue;
+        ctx.fillText(c.name, p.x, p.y);
+      }
     }
     ctx.font = `${Math.round(12 * dpr)}px "Yu Gothic UI", "Hiragino Sans", sans-serif`;
     ctx.fillStyle = 'rgba(255, 236, 200, 0.92)';
